@@ -34,7 +34,18 @@ CREATE TABLE IF NOT EXISTS jobs (
     completed_steps INTEGER NOT NULL DEFAULT 0,
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL,
-    finished_at     REAL
+    finished_at     REAL,
+    -- Raw per-column statistics of the submitted sample, used to re-express
+    -- weights across samples.  NULL only for databases written before this
+    -- column existed; such a job cannot be used as a continuation source.
+    column_mean_json    TEXT,
+    column_std_json     TEXT,
+    column_constant_json TEXT,
+    -- Continuation lineage: the completed source job and the weights this job
+    -- was initialised with (before any of its own updates).
+    source_job_id       TEXT,
+    initial_weights_json TEXT,
+    initial_weights_source TEXT
 );
 
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -132,14 +143,43 @@ def reader(path: Path | str) -> Iterator[sqlite3.Connection]:
 
 
 def init_db(path: Path | str) -> None:
-    """Create the schema if missing.
+    """Create or migrate the schema if missing.
 
     ``executescript`` commits implicitly, so it must not run inside our
     hand-managed transaction; concurrent starts serialise on SQLite's schema
-    lock and every statement is idempotent.
+    lock and every statement is idempotent.  ``CREATE TABLE IF NOT EXISTS``
+    does not add columns to a database created by an earlier version, so the
+    additive continuation columns are applied here too.
     """
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        _migrate_jobs(conn)
     finally:
         conn.close()
+
+
+def _migrate_jobs(conn: sqlite3.Connection) -> None:
+    """Add the continuation columns to a database created before this feature.
+
+    The API and both workers may call this concurrently on startup; SQLite
+    serialises the schema lock, so a losing racer sees ``duplicate column
+    name`` and treats it as already migrated.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+    for name, ddl in (
+        ("column_mean_json", "TEXT"),
+        ("column_std_json", "TEXT"),
+        ("column_constant_json", "TEXT"),
+        ("source_job_id", "TEXT"),
+        ("initial_weights_json", "TEXT"),
+        ("initial_weights_source", "TEXT"),
+    ):
+        if name in existing:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}")
+            existing.add(name)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise

@@ -24,6 +24,37 @@
 - 每批提交的断点包含：`step`、`training_epoch`、`batch_in_epoch`、`weights`、
   `momentum_velocity`、`batch_loss`、`loss`（全量交叉熵）、`progress`、提交时间、
   `worker_id`、`lease_epoch`。
+- 每个任务都保存各特征列的**原始均值、标准差以及常量列标记**（`column_stats`），
+  用于跨样本换算权重。
+
+## 续训（派生任务）
+
+同型号设备补入新标注样本后，可从**已完成**任务派生一个续训任务：
+
+```
+POST /jobs/{source_job_id}/continuations
+{"features": [[...], ...], "labels": [...], "epochs": 3}
+```
+
+- 新样本必须是 8～64 条、**特征列数与源任务相同**；按新样本自身的统计量标准化。
+- 源权重换算到新样本的标准化尺度：
+
+  `c_i = a_i * st_i / ss_i`，`d = b + Σ a_i * (mt_i - ms_i) / ss_i`
+
+  因此派生任务在第一次更新前，对新样本**原始测值**的 logit 与源模型完全一致；
+  新样本中的常量列（标准化后恒为 0）其整段源贡献并入偏置，该列权重保持 0。
+  常量源列权重必然为 0，无需换算。
+- 动量从零开始（`momentum_velocity = [0.0, ...]`）。
+- 新任务保留 `source_job_id`、`initial_weights`、`initial_weights_source`
+  （`scaled_from_source` / `zeros`）以及 `job_derived` 审计事件。
+- 源任务缺少原始统计量（`column_mean_json` 等为 NULL，例如旧库）时拒绝派生：
+  从已标准化的设计矩阵反推统计量只是猜测，不采用。
+- 源任务不存在返回 404；未完成、维度不符、样本非法返回 422（含源任务缺少统计量）。
+- 源任务只读，派生与续训都不会修改源任务；派生任务照常走租约、批次断点，
+  工作器退出后从已确认断点续训，最终权重与不中断时逐位一致。
+
+派生任务同样是普通任务，`GET /jobs/{id}`、`/checkpoints`、`/events` 行为不变。
+同一源可派生多次，也可链式派生（用派生任务再派生）。
 
 ## 启动
 
@@ -40,14 +71,16 @@ docker compose up -d --build
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | `POST` | `/jobs` | 提交 `{"features": [[...]], "labels": [...], "epochs": 3}`，返回 201 与任务 |
+| `POST` | `/jobs/{source_job_id}/continuations` | 从已完成任务派生续训任务，body 同 `/jobs`，返回 201 与新任务 |
 | `GET` | `/jobs` | 最近任务列表 |
-| `GET` | `/jobs/{job_id}` | 已确认步数、进度、损失、当前权重；完成时含 `final_weights` |
+| `GET` | `/jobs/{job_id}` | 已确认步数、进度、损失、当前权重；完成时含 `final_weights`；含 `column_stats`、`source_job_id`、`initial_weights` |
 | `GET` | `/jobs/{job_id}/checkpoints` | 全部批次断点（可按 `after_step` 增量拉取） |
-| `GET` | `/jobs/{job_id}/events` | 审计事件：创建、开始/从第几步续训、完成、丢失租约 |
+| `GET` | `/jobs/{job_id}/events` | 审计事件：创建、派生、开始/从第几步续训、完成、丢失租约 |
 | `GET` | `/workers` | 工作器心跳与租约持有者 |
 | `GET` | `/health` | 健康检查 |
 
-`Swagger`（`/docs`）里直接 `POST /jobs` 提交即可看到训练开始；`GET /jobs/{id}` 与
+`Swagger`（`/docs`）里直接 `POST /jobs` 提交即可看到训练开始；等任务完成后用
+`POST /jobs/{id}/continuations` 提交新样本即可看到续训。`GET /jobs/{id}` 与
 `GET /jobs/{id}/checkpoints` 查看进度与每个断点的权重/动量/损失。
 
 ## 续跑与防回退机制
@@ -67,20 +100,23 @@ docker compose up -d --build
 
 ```bash
 # 完整演示（Docker）：提交 -> 观察 -> kill 当前持有者 -> 接管续跑 -> 对比不中断训练
+#              -> 派生续训 -> 再 kill -> 接管 -> 对比不中断的派生训练
 python3 scripts/demo.py
 
 # 没有 Docker 时用本机进程演示同样流程
 python3 scripts/demo.py --local
 
-# 不依赖 Docker 的三项自检
+# 不依赖 Docker 的四项自检
 python3 scripts/selftest.py
 
-# 单元/集成测试（含真实 uvicorn + 两个工作器进程、SIGKILL 接管、迟到工作器围栏）
+# 单元/集成测试（含真实 uvicorn + 两个工作器进程、SIGKILL 接管、迟到工作器围栏、
+# 派生续训的崩溃接管与逐位一致性）
 python3 -m pytest -q
 ```
 
 演示脚本第 6 步会用同一份输入再训练一次（不中断），并断言两次的 `final_weights`、
-`loss`、`momentum_velocity` 完全相等。
+`loss`、`momentum_velocity` 完全相等；第 7～9 步派生一个续训任务、中途 kill 工作器，
+再与不中断的派生训练对比 `initial_weights`、`final_weights` 与 `loss`。
 
 ## 环境变量
 
@@ -100,11 +136,11 @@ python3 -m pytest -q
 ```
 app/main.py       API 与 Swagger
 app/worker.py     工作器主循环、租约续训
-app/store.py      任务状态机、批次提交、断点查询
+app/store.py      任务状态机、批次提交、断点查询、派生续训
 app/lease.py      租约获取/续约/围栏校验
 app/model.py      逻辑回归、交叉熵、SGD + 动量
-app/features.py   输入校验与标准化
-app/db.py         SQLite 连接与表结构
+app/features.py   输入校验、标准化、原始统计量与跨样本权重换算
+app/db.py         SQLite 连接、表结构与增量迁移
 tests/            单元、API、进程级集成测试
 scripts/demo.py   Swagger 同款接口的端到端演示
 scripts/selftest.py  无 Docker 自检

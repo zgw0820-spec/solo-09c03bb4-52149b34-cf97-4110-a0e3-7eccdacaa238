@@ -283,3 +283,80 @@ def test_late_worker_cannot_regress_or_false_complete(tmp_path):
         finally:
             stop_worker(worker_a)
             stop_worker(worker_b)
+
+
+def continuation_dataset(records: int = 36, seed: int = 77):
+    """A new same-shape sample; deliberately different column means/scales."""
+    rng = np.random.default_rng(seed)
+    features = (rng.normal(size=(records, 4)) * [2.0, 0.5, 3.0, 1.5] + [4.0, -2.0, 0.0, 7.0]).tolist()
+    labels = [1 if row[0] + row[1] > 2.0 else 0 for row in features]
+    return {"features": features, "labels": labels, "epochs": 3}
+
+
+
+def test_continuation_survives_worker_crash_and_matches_uninterrupted(tmp_path):
+    db = tmp_path / "training.db"
+    with Server(db, free_port()) as server:
+        source_job = server.post("/jobs", dataset(records=24, seed=31))
+        worker = start_worker(db, "source")
+        try:
+            source = wait_completed(server, source_job["job_id"])
+        finally:
+            stop_worker(worker)
+
+        # Reference continuation: derived job trained with no interruption.
+        reference_job = server.post(
+            f"/jobs/{source_job['job_id']}/continuations", continuation_dataset()
+        )
+        worker = start_worker(db, "ref")
+        try:
+            reference = wait_completed(server, reference_job["job_id"])
+        finally:
+            stop_worker(worker)
+
+        source_after = server.get(f"/jobs/{source_job['job_id']}")
+        assert source_after == source  # source untouched by the derivation
+
+        # Same derivation again, this time with a hard kill mid-training.
+        job = server.post(
+            f"/jobs/{source_job['job_id']}/continuations", continuation_dataset()
+        )
+        assert job["source_job_id"] == source_job["job_id"]
+        assert job["initial_weights_source"] == "scaled_from_source"
+        assert job["initial_weights"] == job["weights"]
+        assert job["momentum_velocity"] == [0.0] * job["feature_dim"]
+        assert job["initial_weights"] == reference["initial_weights"]
+
+        worker_a = start_worker(db, "worker-a")
+        try:
+            wait_for(
+                lambda: server.get(f"/jobs/{job['job_id']}")["completed_steps"] >= 3,
+                timeout=60,
+                message="first batches of the derived job",
+            )
+        finally:
+            stop_worker(worker_a, hard=True)
+        at_crash = server.get(f"/jobs/{job['job_id']}")
+        assert at_crash["status"] == "running"
+
+        worker_b = start_worker(db, "worker-b")
+        try:
+            final = wait_completed(server, job["job_id"])
+        finally:
+            stop_worker(worker_b)
+
+        assert final["final_weights"] == reference["final_weights"]
+        assert final["momentum_velocity"] == reference["momentum_velocity"]
+        assert final["loss"] == reference["loss"]
+        assert final["source_job_id"] == source_job["job_id"]
+        checkpoints = server.get(f"/jobs/{job['job_id']}/checkpoints")
+        assert [c["step"] for c in checkpoints] == list(range(1, final["total_steps"] + 1))
+
+        starts = [
+            e
+            for e in server.get(f"/jobs/{job['job_id']}/events")
+            if e["event"] == "training_started"
+        ]
+        assert starts[0]["detail"]["resumed_from_step"] == 0
+        assert starts[-1]["detail"]["resumed_from_step"] == at_crash["completed_steps"]
+        assert server.get(f"/jobs/{source_job['job_id']}") == source

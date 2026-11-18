@@ -100,6 +100,26 @@ def sample_records(count: int = 40, seed: int = 3) -> dict:
     return {"features": features, "labels": labels, "epochs": 3}
 
 
+def new_maintenance_sample(count: int = 32, seed: int = 17) -> dict:
+    """Newly labelled records from the same fan model.
+
+    Same four columns, but a different operating window: shifted means and
+    wider vibration/current spread.  That is exactly why raw weights cannot be
+    copied onto a new standardisation scale.
+    """
+    rng = random.Random(seed)
+    shifts = (1.4, 2.6, 0.9, -0.5)
+    scales = (1.8, 0.6, 1.3, 2.2)
+    features, labels = [], []
+    for _ in range(count):
+        base = [rng.gauss(0.0, 1.0) for _ in range(4)]
+        row = [round(base[i] * scales[i] + shifts[i], 4) for i in range(4)]
+        label = 1 if row[0] + 0.4 * row[1] > 2.4 else 0
+        features.append(row)
+        labels.append(label)
+    return {"features": features, "labels": labels, "epochs": 3}
+
+
 def show(job: dict) -> None:
     print(
         f"  status={job['status']:<9} steps={job['completed_steps']}/{job['total_steps']}"
@@ -123,6 +143,19 @@ def kill_worker(mode: str, worker_id: str) -> None:
         pid = int(pid_file.read_text())
         os.kill(pid, signal.SIGKILL)
         print(f"killed local {worker_id} (pid {pid})")
+
+
+def revive_worker(mode: str, worker_id: str) -> None:
+    """Bring back a worker that was previously killed, so takeover is possible."""
+    if mode == "docker":
+        service = worker_id if worker_id.startswith("worker-") else f"worker-{worker_id}"
+        subprocess.run(
+            ["docker", "compose", "start", service], cwd=ROOT, check=True, capture_output=True
+        )
+        print(f"    restarted {service} via docker compose")
+    else:
+        start_local_worker(worker_id)
+        print(f"    restarted local {worker_id}")
 
 
 def step_1_submit() -> dict:
@@ -232,19 +265,100 @@ def step_6_reference(interrupted: dict) -> None:
     print("    PASS: resumed run is bit-identical to an uninterrupted run")
 
 
-def local_up() -> subprocess.Popen:
-    """Start API + two workers locally for environments without Docker."""
-    data = ROOT / "data"
-    data.mkdir(exist_ok=True)
+def step_7_continuation(source: dict) -> dict:
+    """Derive a new job from the completed job and new same-shape samples."""
+    print(
+        f"\n[7] deriving a continuation from completed job {source['job_id'][:8]}"
+        " with 32 new same-model records"
+    )
+    job = call(
+        "POST", f"/jobs/{source['job_id']}/continuations", new_maintenance_sample()
+    )
+    print(f"    job_id={job['job_id']}  source={job['source_job_id'][:8]}")
+    print(
+        f"    initial weights source={job['initial_weights_source']}"
+        f"  momentum={job['momentum_velocity']}"
+    )
+    print(
+        f"    initial weights on the new sample's standardisation ="
+        f" {[round(w, 6) for w in job['initial_weights']]}"
+    )
+    print(f"    source weights (new sample's scale)                 = {[round(w, 6) for w in source['final_weights']]}")
+    print(
+        "    => the derived job starts with the source model re-expressed for the"
+        " new sample's raw measurements"
+    )
+    return job
+
+
+def step_8_continuation_reference(job_id: str) -> dict:
+    print("\n[8] waiting for the derived job to finish")
+    final = wait_for(
+        lambda: _state_if_completed(job_id),
+        timeout=180,
+        message="derived job completion",
+    )
+    show(final)
+    print(f"    final weights = {final['final_weights']}")
+    return final
+
+
+def step_9_continuation_equivalence(source_job_id: str, interrupted: dict) -> None:
+    """Derive the same continuation again without interruption and compare."""
+    print("\n[9] equivalence check: the same derived job, no interruption")
+    job = call(
+        "POST", f"/jobs/{source_job_id}/continuations", new_maintenance_sample()
+    )
+    reference = wait_for(
+        lambda: _state_if_completed(job["job_id"]),
+        timeout=180,
+        message="uninterrupted derived completion",
+    )
+    same = (
+        reference["final_weights"] == interrupted["final_weights"]
+        and reference["loss"] == interrupted["loss"]
+        and reference["initial_weights"] == interrupted["initial_weights"]
+    )
+    print(f"    initial weights identical: {reference['initial_weights'] == interrupted['initial_weights']}")
+    print(f"    final weights identical  : {reference['final_weights'] == interrupted['final_weights']}")
+    print(f"    loss identical           : {reference['loss'] == interrupted['loss']}")
+    if not same:
+        raise SystemExit("FAIL: resumed derived run differs from the uninterrupted one")
+    print("    PASS: derived job resumed bit-identically and kept its source lineage")
+
+
+def local_env() -> dict[str, str]:
     env = dict(os.environ)
     env.update(
-        TRAINING_DATA_DIR=str(data),
+        TRAINING_DATA_DIR=str(ROOT / "data"),
         TRAINING_LEASE_SECONDS="3",
         TRAINING_HEARTBEAT_INTERVAL="0.8",
         TRAINING_BATCH_DELAY_SECONDS="0.5",
         PYTHONPATH=str(ROOT),
         PYTHONUNBUFFERED="1",
     )
+    return env
+
+
+def start_local_worker(worker: str) -> subprocess.Popen:
+    logs = ROOT / "data" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "app.worker", "--worker-id", worker],
+        cwd=ROOT,
+        env=local_env(),
+        stdout=open(logs / f"{worker}.log", "a"),
+        stderr=subprocess.STDOUT,
+    )
+    (ROOT / f".demo-{worker}.pid").write_text(str(proc.pid))
+    return proc
+
+
+def local_up() -> subprocess.Popen:
+    """Start API + two workers locally for environments without Docker."""
+    data = ROOT / "data"
+    data.mkdir(exist_ok=True)
+    env = local_env()
     logs = ROOT / "data" / "logs"
     logs.mkdir(exist_ok=True)
     api = subprocess.Popen(
@@ -256,14 +370,7 @@ def local_up() -> subprocess.Popen:
     )
     (ROOT / ".demo-api.pid").write_text(str(api.pid))
     for worker in ("worker-1", "worker-2"):
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "app.worker", "--worker-id", worker],
-            cwd=ROOT,
-            env=env,
-            stdout=open(logs / f"{worker}.log", "w"),
-            stderr=subprocess.STDOUT,
-        )
-        (ROOT / f".demo-{worker}.pid").write_text(str(proc.pid))
+        start_local_worker(worker)
     wait_for(_healthy, timeout=30, message="local API")
     return api
 
@@ -310,10 +417,22 @@ def main() -> int:
     try:
         job = step_1_submit()
         step_2_watch(job["job_id"], args.stop_after)
+        killed = _lease_for(job["job_id"])
         step_3_kill(mode, job["job_id"])
         step_4_failover(job["job_id"])
         final = step_5_final(job["job_id"])
         step_6_reference(final)
+
+        print("\n[6b] both workers are needed again for the continuation demo")
+        if killed is not None:
+            revive_worker(mode, killed["worker_id"])
+
+        derived = step_7_continuation(final)
+        step_2_watch(derived["job_id"], args.stop_after)
+        step_3_kill(mode, derived["job_id"])
+        step_4_failover(derived["job_id"])
+        derived_final = step_8_continuation_reference(derived["job_id"])
+        step_9_continuation_equivalence(final["job_id"], derived_final)
     finally:
         if args.local:
             local_down()

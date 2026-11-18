@@ -30,8 +30,10 @@ from .features import (
     MAX_EPOCHS,
     MIN_EPOCHS,
     MOMENTUM,
+    FeatureStats,
     InputError,
-    normalise,
+    normalise_samples,
+    rescale_weights,
 )
 from .lease import Lease, LeaseLost, owner_ok
 from .model import dataset_loss, sgd_step
@@ -45,6 +47,10 @@ class JobNotFound(LookupError):
 
 class StateConflict(RuntimeError):
     """The database changed in a way that should be impossible."""
+
+
+class SourceConflict(InputError):
+    """The requested continuation source is missing, unfinished or unusable."""
 
 
 def _dumps(values: np.ndarray) -> str:
@@ -66,6 +72,14 @@ def _event(conn, job_id: str, event: str, detail: dict[str, Any] | None = None) 
     )
 
 
+def _stats_columns(stats: FeatureStats) -> tuple[str, str, str]:
+    return (
+        _dumps(stats.mean),
+        _dumps(stats.std),
+        json.dumps([bool(v) for v in stats.constant]),
+    )
+
+
 def create_job(
     db_path,
     features: list[list[float]],
@@ -75,7 +89,7 @@ def create_job(
     """Validate, normalise and enqueue a training job."""
     if not (MIN_EPOCHS <= epochs <= MAX_EPOCHS):
         raise InputError(f"epochs must be between {MIN_EPOCHS} and {MAX_EPOCHS}")
-    design, targets = normalise(features, labels)
+    design, targets, stats = normalise_samples(features, labels)
     feature_dim = int(design.shape[1])
     per_epoch = math.ceil(design.shape[0] / BATCH_SIZE)
     total_steps = per_epoch * epochs
@@ -85,14 +99,17 @@ def create_job(
 
     job_id = uuid.uuid4().hex
     now = time.time()
+    mean_json, std_json, constant_json = _stats_columns(stats)
     with transaction(db_path) as conn:
         conn.execute(
             """
             INSERT INTO jobs(
                 job_id, status, feature_dim, epochs, batch_size, record_count,
                 total_batches, learning_rate, momentum, features_json, labels_json,
-                weights_json, velocity_json, loss, completed_steps, created_at, updated_at
-            ) VALUES(?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                weights_json, velocity_json, loss, completed_steps, created_at, updated_at,
+                column_mean_json, column_std_json, column_constant_json,
+                initial_weights_json, initial_weights_source
+            ) VALUES(?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'zeros')
             """,
             (
                 job_id,
@@ -110,6 +127,10 @@ def create_job(
                 initial_loss,
                 now,
                 now,
+                mean_json,
+                std_json,
+                constant_json,
+                _dumps(weights),
             ),
         )
         _event(
@@ -121,6 +142,167 @@ def create_job(
                 "epochs": epochs,
                 "batches_per_epoch": per_epoch,
                 "total_steps": total_steps,
+                "initial_weights_source": "zeros",
+            },
+        )
+    job = get_job(db_path, job_id)
+    assert job is not None
+    return job
+
+
+def _source_stats(row) -> FeatureStats | None:
+    """Raw statistics stored for ``row``, or ``None`` if never recorded."""
+    if row["column_mean_json"] is None or row["column_std_json"] is None:
+        return None
+    if row["column_constant_json"] is None:
+        return None
+    return FeatureStats(
+        mean=_loads(row["column_mean_json"]),
+        std=_loads(row["column_std_json"]),
+        constant=np.asarray(json.loads(row["column_constant_json"]), dtype=bool),
+    )
+
+
+def scale_transfer_weights(
+    source_row,
+    source_weights: np.ndarray,
+    target_stats: FeatureStats,
+) -> np.ndarray:
+    """Map ``source_weights`` onto ``target_stats``' standardisation scale.
+
+    Refuses when the source never recorded raw statistics: recovering the raw
+    scale by inverting the stored standardised-design matrix would be a guess,
+    not the source's actual statistics.
+    """
+    stats = _source_stats(source_row)
+    if stats is None:
+        raise SourceConflict(
+            f"source job {source_row['job_id']} has no stored raw column statistics; "
+            "cannot derive a continuation from it"
+        )
+    if int(source_row["feature_dim"]) != int(target_stats.mean.shape[0]) + 1:
+        raise InputError("source job feature dimension does not match the new sample")
+    return rescale_weights(source_weights, stats, target_stats)
+
+
+def create_continuation_job(
+    db_path,
+    source_job_id: str,
+    features: list[list[float]],
+    labels: list[int],
+    epochs: int,
+) -> dict[str, Any]:
+    """Derive a new training job from a completed job's weights.
+
+    The new sample must have the same number of feature columns.  The source
+    model's weights are converted to the new sample's standardisation scale, so
+    the derived job's predictions on the new sample's *raw* measurements - and
+    on its bias term - equal the source model's predictions before any update.
+    Momentum starts at zero.  The source job is only read, never modified.
+
+    A source job without stored raw column statistics is rejected rather than
+    having those statistics inferred from its standardised design matrix.
+    """
+    if not (MIN_EPOCHS <= epochs <= MAX_EPOCHS):
+        raise InputError(f"epochs must be between {MIN_EPOCHS} and {MAX_EPOCHS}")
+    design, targets, stats = normalise_samples(features, labels)
+    feature_dim = int(design.shape[1])
+    per_epoch = math.ceil(design.shape[0] / BATCH_SIZE)
+    total_steps = per_epoch * epochs
+
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    mean_json, std_json, constant_json = _stats_columns(stats)
+    with transaction(db_path) as conn:
+        # Read the source inside the same transaction as the insert, so the
+        # weights we derive from are exactly the source's final weights.
+        source = _job_row(conn, source_job_id)
+        if source is None:
+            raise JobNotFound(source_job_id)
+        if source["status"] != "completed":
+            raise SourceConflict(
+                f"source job {source_job_id} is {source['status']}, not completed"
+            )
+        if int(source["completed_steps"]) != int(source["total_batches"]) * int(source["epochs"]):
+            raise SourceConflict(f"source job {source_job_id} has not finished all steps")
+        latest = conn.execute(
+            "SELECT step, weights_json FROM checkpoints WHERE job_id=? "
+            "ORDER BY step DESC LIMIT 1",
+            (source_job_id,),
+        ).fetchone()
+        if latest is None or int(latest["step"]) != int(source["completed_steps"]):
+            raise SourceConflict(f"source job {source_job_id} has no committed final checkpoint")
+        if latest["weights_json"] != source["weights_json"]:
+            raise StateConflict("source final checkpoint weights do not match job weights")
+        if int(source["feature_dim"]) != feature_dim:
+            raise InputError(
+                f"source job {source_job_id} has {int(source['feature_dim']) - 1} feature "
+                f"columns, new sample has {feature_dim - 1}"
+            )
+        source_weights = _loads(latest["weights_json"])
+        weights = scale_transfer_weights(source, source_weights, stats)
+        velocity = np.zeros(feature_dim, dtype=np.float64)
+        initial_loss = dataset_loss(weights, design, targets)
+
+        conn.execute(
+            """
+            INSERT INTO jobs(
+                job_id, status, feature_dim, epochs, batch_size, record_count,
+                total_batches, learning_rate, momentum, features_json, labels_json,
+                weights_json, velocity_json, loss, completed_steps, created_at, updated_at,
+                column_mean_json, column_std_json, column_constant_json,
+                source_job_id, initial_weights_json, initial_weights_source
+            ) VALUES(
+                ?, 'queued', ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, 0, ?, ?,
+                ?, ?, ?,
+                ?, ?, 'scaled_from_source'
+            )
+            """,
+            (
+                job_id,
+                feature_dim,
+                epochs,
+                BATCH_SIZE,
+                int(design.shape[0]),
+                per_epoch,
+                LEARNING_RATE,
+                MOMENTUM,
+                json.dumps(design.tolist()),
+                json.dumps([float(v) for v in targets], allow_nan=False),
+                _dumps(weights),
+                _dumps(velocity),
+                initial_loss,
+                now,
+                now,
+                mean_json,
+                std_json,
+                constant_json,
+                source_job_id,
+                _dumps(weights),
+            ),
+        )
+        _event(
+            conn,
+            job_id,
+            "job_created",
+            {
+                "records": int(design.shape[0]),
+                "epochs": epochs,
+                "batches_per_epoch": per_epoch,
+                "total_steps": total_steps,
+                "initial_weights_source": "scaled_from_source",
+                "source_job_id": source_job_id,
+            },
+        )
+        _event(
+            conn,
+            job_id,
+            "job_derived",
+            {
+                "source_job_id": source_job_id,
+                "initial_weights": [float(v) for v in weights],
+                "momentum": "zeros",
             },
         )
     job = get_job(db_path, job_id)
@@ -153,10 +335,16 @@ def get_job(db_path, job_id: str) -> dict[str, Any] | None:
         design = np.asarray(json.loads(row["features_json"]), dtype=np.float64)
         targets = np.asarray(json.loads(row["labels_json"]), dtype=np.float64)
         evaluation_loss = dataset_loss(_loads(row["weights_json"]), design, targets)
+        stats = _source_stats(row)
 
     completed = int(row["completed_steps"])
     total = int(row["total_batches"]) * int(row["epochs"])
     latest_step = int(checkpoint["step"]) if checkpoint is not None else 0
+    initial_weights = (
+        _loads(row["initial_weights_json"]).tolist()
+        if row["initial_weights_json"] is not None
+        else None
+    )
     return {
         "job_id": row["job_id"],
         "status": row["status"],
@@ -178,6 +366,18 @@ def get_job(db_path, job_id: str) -> dict[str, Any] | None:
         "final_weights": (
             _loads(row["weights_json"]).tolist() if row["status"] == "completed" else None
         ),
+        "column_stats": (
+            None
+            if stats is None
+            else {
+                "mean": stats.mean.tolist(),
+                "std": stats.std.tolist(),
+                "constant": [bool(v) for v in stats.constant],
+            }
+        ),
+        "source_job_id": row["source_job_id"],
+        "initial_weights": initial_weights,
+        "initial_weights_source": row["initial_weights_source"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "finished_at": row["finished_at"],

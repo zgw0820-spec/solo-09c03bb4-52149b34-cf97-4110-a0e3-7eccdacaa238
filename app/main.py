@@ -54,6 +54,28 @@ class TrainingRequest(BaseModel):
     epochs: int = Field(2, ge=2, le=5, description="Training epochs (2-5).")
 
 
+class ContinuationRequest(BaseModel):
+    source_job_id: str | None = Field(
+        None,
+        description="Optional echo of the path's source job id; must match it.",
+        examples=["3f2a9c1d4b5e6f708192a3b4c5d6e7f8"],
+    )
+    features: list[list[float]] = Field(
+        ...,
+        description=(
+            "8-64 new labelled records with the same number of feature columns as "
+            "the source. They are standardised with their own column statistics."
+        ),
+        examples=[[[0.13, 3.3], [0.18, 3.7], [0.66, 5.3], [0.74, 5.6]]],
+    )
+    labels: list[int] = Field(
+        ...,
+        description="One shutdown label per record: 0 = healthy, 1 = shutdown warning.",
+        examples=[[0, 0, 1, 1]],
+    )
+    epochs: int = Field(2, ge=2, le=5, description="Training epochs (2-5).")
+
+
 @app.get("/health", tags=["system"])
 def health() -> dict[str, Any]:
     with reader(settings.db_path) as conn:
@@ -68,6 +90,38 @@ def submit_job(request: TrainingRequest) -> dict[str, Any]:
         return store.create_job(
             settings.db_path, request.features, request.labels, request.epochs
         )
+    except InputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/jobs/{source_job_id}/continuations", status_code=201, tags=["training"])
+def submit_continuation(
+    source_job_id: str, request: ContinuationRequest
+) -> dict[str, Any]:
+    """Derive a new training job from a completed job's final weights.
+
+    The new sample must use the same feature dimension.  The source weights are
+    mapped onto the new sample's standardisation scale, so before the first
+    update the derived job scores the new sample's raw measurements exactly as
+    the source job did; momentum starts at zero.  The source job is unchanged.
+    A source without stored raw column statistics, an unfinished source, or a
+    dimension mismatch is rejected rather than guessed around.
+    """
+    if request.source_job_id is not None and request.source_job_id != source_job_id:
+        raise HTTPException(
+            status_code=422,
+            detail="source_job_id in the body must match the path",
+        )
+    try:
+        return store.create_continuation_job(
+            settings.db_path,
+            source_job_id,
+            request.features,
+            request.labels,
+            request.epochs,
+        )
+    except store.JobNotFound as exc:
+        raise HTTPException(status_code=404, detail="source job not found") from exc
     except InputError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

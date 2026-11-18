@@ -6,6 +6,10 @@
 2. ``equivalence``: with real worker processes, kill one mid-training and prove
    the finished weights are bit-identical to an uninterrupted run.
 3. ``late``: a frozen (still-running) old worker cannot write after takeover.
+4. ``continuation``: derive a new job from a completed job's weights with a new
+   same-shape sample, kill a worker mid-way, and prove the final weights match
+   an uninterrupted derived run.  Also checks the derived job keeps its source
+   and transferred initial weights while the source job stays unchanged.
 
 Each check prints PASS/FAIL and exits non-zero if anything fails.
 """
@@ -159,6 +163,24 @@ def dataset(seed: int = 21, records: int = 40) -> dict:
     return {"features": features, "labels": labels, "epochs": 3}
 
 
+def new_sample(seed: int = 91, records: int = 32) -> dict:
+    """A same-shape supplement with different column means and scales."""
+    import random
+
+    rng = random.Random(seed)
+    shifts = (4.0, -2.0, 0.0, 7.0)
+    scales = (2.0, 0.5, 3.0, 1.5)
+    features = [
+        [
+            round(rng.gauss(0, 1) * scales[column] + shifts[column], 4)
+            for column in range(4)
+        ]
+        for _ in range(records)
+    ]
+    labels = [1 if row[0] + row[1] > 2.0 else 0 for row in features]
+    return {"features": features, "labels": labels, "epochs": 3}
+
+
 def completed_state(port: int, job_id: str) -> dict:
     return wait_for(
         lambda: (state := get(port, f"/jobs/{job_id}"))["status"] == "completed" and state,
@@ -271,6 +293,67 @@ def check_late_worker(tmp: Path) -> bool:
     return True
 
 
+def check_continuation(tmp: Path) -> bool:
+    """Derive a continuation, kill a worker mid-way, compare with no interruption."""
+    db = tmp / "continuation.db"
+    api, port = start_api(db)
+    worker = start_worker(db, "source")
+    try:
+        source_job = post(port, "/jobs", dataset(records=24, seed=33))
+        source = completed_state(port, source_job["job_id"])
+    finally:
+        stop(worker)
+
+    reference_job = post(
+        port, f"/jobs/{source_job['job_id']}/continuations", new_sample()
+    )
+    assert reference_job["source_job_id"] == source_job["job_id"]
+    assert reference_job["initial_weights_source"] == "scaled_from_source"
+    assert reference_job["momentum_velocity"] == [0.0] * reference_job["feature_dim"]
+    worker = start_worker(db, "reference")
+    try:
+        reference = completed_state(port, reference_job["job_id"])
+    finally:
+        stop(worker)
+    assert get(port, f"/jobs/{source_job['job_id']}") == source
+
+    derived_job = post(
+        port, f"/jobs/{source_job['job_id']}/continuations", new_sample()
+    )
+    assert derived_job["initial_weights"] == reference["initial_weights"]
+    worker_a = start_worker(db, "worker-a")
+    try:
+        wait_for(
+            lambda: get(port, f"/jobs/{derived_job['job_id']}")["completed_steps"] >= 3,
+            60,
+            "derived first batches",
+        )
+    finally:
+        stop(worker_a, hard=True)
+    interrupted = get(port, f"/jobs/{derived_job['job_id']}")
+    worker_b = start_worker(db, "worker-b")
+    try:
+        final = completed_state(port, derived_job["job_id"])
+        checkpoints = get(port, f"/jobs/{derived_job['job_id']}/checkpoints")
+    finally:
+        stop(worker_b)
+        stop(api)
+
+    assert final["final_weights"] == reference["final_weights"], (
+        final["final_weights"],
+        reference["final_weights"],
+    )
+    assert final["momentum_velocity"] == reference["momentum_velocity"]
+    assert final["loss"] == reference["loss"]
+    assert [c["step"] for c in checkpoints] == list(range(1, final["total_steps"] + 1))
+    print(
+        f"  PASS: derived from {source_job['job_id'][:8]}, killed at step"
+        f" {interrupted['completed_steps']}, resumed to {final['completed_steps']},"
+        f" weights initialised from the source and final weights match"
+    )
+    return True
+
+
 def main() -> int:
     failures = []
     with tempfile.TemporaryDirectory() as raw:
@@ -279,6 +362,7 @@ def main() -> int:
             ("compose", check_compose),
             ("killed-worker equivalence", lambda: check_equivalence(tmp)),
             ("late-worker fencing", lambda: check_late_worker(tmp)),
+            ("continuation equivalence", lambda: check_continuation(tmp)),
         ):
             print(f"[{name}]")
             try:
